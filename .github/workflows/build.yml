@@ -20,20 +20,29 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK base
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-37 build-tools;37.0.0'
+          packages: 'platform-tools'
           accept-android-sdk-licenses: true
 
-      - name: Verify toolchain
+      - name: Install SDK platform 37 and build-tools
         run: |
-          java -version
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms"
-          ls "$ANDROID_HOME/build-tools"
-          unzip -l gradle/wrapper/gradle-wrapper.jar | tail -3
-          ls -l gradlew
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SM="$(find "$SDK/cmdline-tools" -maxdepth 4 -name sdkmanager -type f | sort | tail -1)"
+          echo "sdkmanager: $SM"
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          "$SM" "platforms;android-37.2" "build-tools;37.0.0"
+          if [ ! -d "$SDK/platforms/android-37" ] && [ -d "$SDK/platforms/android-37.2" ]; then
+            echo "Creating android-37 directory alias for AGP compileSdk 37"
+            cp -r "$SDK/platforms/android-37.2" "$SDK/platforms/android-37"
+            sed -i 's/^AndroidVersion.ApiLevel=.*/AndroidVersion.ApiLevel=37/' "$SDK/platforms/android-37/source.properties"
+          fi
+          echo "--- platforms ---"
+          ls -la "$SDK/platforms"
+          echo "--- build-tools ---"
+          ls -la "$SDK/build-tools"
 
       - name: Make gradlew executable
         run: chmod +x ./gradlew
