@@ -42,3 +42,9 @@ scr_backup.png
 # 本机工具状态与服务器取证，不进入公开仓库
 .zcode/
 website-evidence/
+
+# CI 现场从官方 release 拉取的大体积运行时输入（不进 git）
+app/src/main/assets/pnpm-runtime.bin
+app/src/main/assets/python-support.bin
+app/src/main/assets/glibc-python.tar.gz
+app/src/main/assets/adb-wheels.tar.gz

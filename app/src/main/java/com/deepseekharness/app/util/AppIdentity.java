@@ -5,15 +5,15 @@ public final class AppIdentity {
   private AppIdentity() {}
 
   public static String applicationId() {
-    return "dsh.android.client";
+    return "com.huanlab.dshamod";
   }
 
   public static String displayName() {
-    return "DSHA";
+    return "DSHA 魔改版";
   }
 
   public static String publicDirectoryName() {
-    return "DSHA";
+    return "DSHA-Mod";
   }
 
   public static String defaultUpdateFeed() {

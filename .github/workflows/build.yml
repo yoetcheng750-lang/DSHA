@@ -1,4 +1,4 @@
-name: Build APK
+name: Build DSHA Mod APK
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout code
@@ -33,16 +33,34 @@ jobs:
           SM="$(find "$SDK/cmdline-tools" -maxdepth 4 -name sdkmanager -type f | sort | tail -1)"
           echo "sdkmanager: $SM"
           yes | "$SM" --licenses > /dev/null 2>&1 || true
-          "$SM" "platforms;android-37.2" "build-tools;37.0.0"
+          "$SM" "platforms;android-37.2" "build-tools;36.0.0"
           if [ ! -d "$SDK/platforms/android-37" ] && [ -d "$SDK/platforms/android-37.2" ]; then
             echo "Creating android-37 directory alias for AGP compileSdk 37"
             cp -r "$SDK/platforms/android-37.2" "$SDK/platforms/android-37"
             sed -i 's/^AndroidVersion.ApiLevel=.*/AndroidVersion.ApiLevel=37/' "$SDK/platforms/android-37/source.properties"
           fi
-          echo "--- platforms ---"
-          ls -la "$SDK/platforms"
-          echo "--- build-tools ---"
-          ls -la "$SDK/build-tools"
+          echo "--- platforms ---"; ls -la "$SDK/platforms"
+          echo "--- build-tools ---"; ls -la "$SDK/build-tools"
+
+      - name: Fetch offline runtime assets from upstream release
+        run: |
+          set -euo pipefail
+          APK="dsha-0.2.1-rc.2.apk"
+          URL="https://github.com/DSH-APP/DSHA/releases/download/v0.2.1-rc.2/${APK}"
+          SHA="d62f17f23a7949f0f25285ec7afa44cb35de24a6bc91887ba4600023d18ffee0"
+          echo "Downloading ${URL}"
+          curl -fL --retry 3 --retry-delay 5 -o "/tmp/${APK}" "$URL"
+          echo "${SHA}  /tmp/${APK}" | sha256sum -c -
+          rm -rf /tmp/up && mkdir -p /tmp/up
+          unzip -o -q "/tmp/${APK}" 'assets/*' -d /tmp/up
+          A=app/src/main/assets
+          for f in dsh-runtime.bin offline-rootfs.bin ubuntu-tools.bin python-support.bin pnpm-runtime.bin; do
+            cp -f "/tmp/up/assets/${f}" "$A/${f}"
+          done
+          cp -f /tmp/up/assets/glibc-python.bin "$A/glibc-python.tar.gz"
+          cp -f /tmp/up/assets/adb-wheels.bin "$A/adb-wheels.tar.gz"
+          echo "--- staged runtime assets ---"
+          ls -lh "$A/dsh-runtime.bin" "$A/offline-rootfs.bin" "$A/ubuntu-tools.bin" "$A/python-support.bin" "$A/pnpm-runtime.bin" "$A/glibc-python.tar.gz" "$A/adb-wheels.tar.gz"
 
       - name: Make gradlew executable
         run: chmod +x ./gradlew
@@ -53,6 +71,12 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: DSHA-Standard-Debug-APK
+          name: DSHA-Mod-Standard-Debug-APK
           path: app/build/outputs/apk/standard/debug/*.apk
           if-no-files-found: warn
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "### APK artifacts" >> "$GITHUB_STEP_SUMMARY"
+          find app/build/outputs -name "*.apk" -exec ls -lh {} \; 2>/dev/null | tee -a "$GITHUB_STEP_SUMMARY" || true

@@ -47,7 +47,7 @@ android {
     ndkVersion '26.3.11579264'
 
     defaultConfig {
-        applicationId "dsh.android.client"
+        applicationId "com.huanlab.dshamod"
         minSdk 30
         targetSdk 37
         buildConfigField 'String', 'BUNDLED_PNPM_VERSION', '"' + bundledTools.pnpm.version + '"'
@@ -150,10 +150,10 @@ android {
     }
 
     sourceSets {
-        // CI minimal build: package the checked-in assets directly instead of
-        // build/generated/** produced by the (disabled) python asset pipeline.
-        main.assets.setSrcDirs([file("src/main/assets")])
-        // UiMessages.java is pre-generated into src/main/java for this build.
+        // Upstream pipeline: assets are produced into build/generated/** by the python tasks.
+        main.assets.setSrcDirs([layout.buildDirectory.dir("generated/standardAssets").get().asFile,
+                layout.buildDirectory.dir("generated/recoveryAssets").get().asFile])
+        // UiMessages.java is checked in under src/main/java, so no generated java dir is needed.
     }
 }
 
@@ -358,7 +358,7 @@ def verifyBackupDependencies = tasks.register("verifyBackupDependencies") {
 }
 // CI minimal build: backup dependency lock verification disabled.
 // tasks.withType(JavaCompile).configureEach { dependsOn(verifyBackupDependencies) }
-// tasks.named("preBuild").configure { dependsOn(prepareStandardAssets, prepareRecoveryAssets) }
+tasks.named("preBuild").configure { dependsOn(prepareStandardAssets, prepareRecoveryAssets) }
 def prepareUiLanguages = tasks.register("prepareUiLanguages", Exec) {
     inputs.file(rootProject.file("tools/prepare-ui-languages.py"))
     inputs.file(rootProject.file("tools/i18n/messages.json"))
@@ -415,11 +415,7 @@ tasks.withType(Test).configureEach {
         'verifyCredentialRegistry',
         'verifyProrootCompat',
         'verifyBundledDshVersion',
-        'prepareStandardAssets',
-        'prepareBackupAssets',
-        'prepareRuntimeDescriptor',
         'verifyRuntimeDescriptorInputs',
-        'prepareRecoveryAssets',
         'prepareUiLanguages',
         'verifyBackupDependencies',
         'signPublishRelease',
