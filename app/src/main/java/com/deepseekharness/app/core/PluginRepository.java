@@ -1,0 +1,1277 @@
+package com.deepseekharness.app.core;
+
+import android.app.Application;
+import android.content.Context;
+import android.net.Uri;
+import android.provider.DocumentsContract;
+
+import androidx.annotation.NonNull;
+import androidx.lifecycle.AndroidViewModel;
+import androidx.lifecycle.LiveData;
+import androidx.lifecycle.MutableLiveData;
+
+import com.deepseekharness.app.runtime.ProotBootstrap;
+import com.deepseekharness.app.util.PluginSource;
+import com.deepseekharness.app.util.SensitiveData;
+import com.deepseekharness.app.util.ShellQuote;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** 应用范围的插件操作状态；任务只持有 Application，切页/旋转不会丢失结果。 */
+public final class PluginRepository extends AndroidViewModel {
+  private static final long MAX_ARCHIVE = 256L * 1024 * 1024;
+  private static final ExecutorService IO = Executors.newSingleThreadExecutor();
+  private final java.util.concurrent.Executor io;
+  private final long queryMillis;
+  private final AtomicBoolean working = new AtomicBoolean();
+  private final AtomicLong installedRevision = new AtomicLong();
+  private final MutableLiveData<State> state =
+      new MutableLiveData<>(new State(Collections.emptyList(), false, "选择链接安装或导入本地插件包"));
+  private volatile List<Item> items = Collections.emptyList();
+  private volatile boolean itemsKnown;
+  private volatile boolean safeMode;
+  private volatile boolean installationSucceeded;
+  private volatile PluginTask activeTask;
+  private volatile boolean queryRunning;
+  private boolean refreshQueued;
+  private final Runnable queuedRefresh =
+      () -> {
+        if (refreshQueued && !working.get()) {
+          refreshQueued = false;
+          refresh();
+        }
+      };
+  private final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
+  private Preview installedPreview;
+  private volatile Preview preparedPreview;
+  private final MutableLiveData<Preview> preview = new MutableLiveData<>();
+  private volatile List<PendingReview> pendingReviews = Collections.emptyList();
+
+  public static final class PendingReview {
+    public final String id, label;
+
+    PendingReview(JSONObject value) throws Exception {
+      id = value.getString("previewId");
+      if (!id.matches("[a-f0-9]{32}")) throw new IOException("插件预览标识无效");
+      JSONArray names = value.getJSONArray("names");
+      List<String> text = new ArrayList<>();
+      for (int i = 0; i < names.length(); i++) text.add(names.getString(i));
+      label = String.join("、", text);
+    }
+  }
+
+  public static final class Item {
+    private final JSONObject snapshot;
+    public final String name, description, version, source;
+    public final String location, origin;
+    public final boolean detected;
+    public final boolean dynamic;
+    public final String latestVersion,
+        updatePreviewId,
+        updateMessage,
+        rollbackVersion,
+        compatibility;
+    public final String loadState;
+    public final boolean updateAvailable, updatable;
+    public final boolean enabled,
+        builtin,
+        official,
+        available,
+        exportable,
+        deletable,
+        runtimeProvided,
+        runtimeLocated;
+
+    Item(JSONObject json) {
+      snapshot = json;
+      name = json.optString("name");
+      description = json.optString("description");
+      version = json.optString("version");
+      source = json.optString("source");
+      location = json.optString("location");
+      detected = json.optBoolean("detected");
+      dynamic = json.optBoolean("dynamic");
+      enabled = json.optBoolean("enabled");
+      // Names are identities, not an npm-scope classifier. Only the signed
+      // registry and its one explicit historical alias own the builtin role.
+      builtin =
+          json.optBoolean("builtin")
+              && (com.deepseekharness.app.util.BuiltinPlugins.SIGNED_BUILTINS.contains(name)
+                  || "@deepseek-ai/dsh-experimental-auto-review".equals(name));
+      runtimeProvided = json.optBoolean("runtimeProvided");
+      runtimeLocated = json.optBoolean("runtimeLocated", runtimeProvided);
+      origin = builtin ? "dsha-signed" : runtimeProvided ? "dsh-managed" : "user";
+      official =
+          json.optBoolean("official")
+              && com.deepseekharness.app.util.BuiltinPluginRegistry.OFFICIAL.contains(name);
+      available = json.optBoolean("available");
+      exportable = json.optBoolean("exportable");
+      deletable = json.optBoolean("deletable");
+      latestVersion = json.optString("latestVersion");
+      updatePreviewId = json.optString("updatePreviewId");
+      updateMessage = json.optString("updateMessage");
+      rollbackVersion = json.optString("rollbackVersion");
+      compatibility = json.optString("compatibility");
+      updateAvailable = json.optBoolean("updateAvailable");
+      updatable = json.optBoolean("updatable");
+      loadState = json.optString("loadState");
+    }
+
+    Item withIntent(boolean enabled) throws Exception {
+      return new Item(
+          new JSONObject(snapshot.toString())
+              .put("enabled", enabled)
+              .put("loadState", enabled ? "queued" : "disabled"));
+    }
+  }
+
+  public static final class Preview {
+    public final String id, description, confirmation, action;
+
+    Preview(JSONObject json) throws Exception {
+      id = json.getString("previewId");
+      if (!id.matches("[a-f0-9]{32}")) throw new IOException("插件预览标识无效");
+      confirmation = json.getString("confirmationSha256");
+      action = json.optString("action", "install");
+      if (!confirmation.matches("[a-f0-9]{64}")) throw new IOException("插件预览标识无效");
+      data = new JSONObject(json.toString());
+      JSONArray packages = data.getJSONArray("items");
+      for (int i = 0; i < packages.length(); i++) packages.getJSONObject(i).getString("name");
+      description = description();
+    }
+
+    private final JSONObject data;
+
+    public boolean blocked() {
+      JSONArray items = data.optJSONArray("items");
+      if (items != null)
+        for (int i = 0; i < items.length(); i++) {
+          JSONObject item = items.optJSONObject(i);
+          if (item != null
+              && (item.optBoolean("existingConflict")
+                  || item.optJSONArray("missingDependencies") != null
+                      && item.optJSONArray("missingDependencies").length() > 0)) return true;
+        }
+      return false;
+    }
+
+    public String description() {
+      JSONObject json = data;
+      StringBuilder text = new StringBuilder();
+      JSONArray packages = json.optJSONArray("items");
+      for (int i = 0; i < packages.length(); i++) {
+        JSONObject pkg = packages.optJSONObject(i);
+        text.append(pkg.optString("name"))
+            .append(" · ")
+            .append(pkg.optString("version"))
+            .append(com.deepseekharness.app.util.UiText.text("\n作者："))
+            .append(pkg.optString("author", com.deepseekharness.app.util.UiText.text("未注明")))
+            .append("\n")
+            .append(pkg.optString("description"))
+            .append("\n")
+            .append(
+                com.deepseekharness.app.util.UiStateText.render(
+                    pkg.optString("compatibilityMessage")))
+            .append("\n\n");
+        JSONArray dependencies = pkg.optJSONArray("resolvedDependencies");
+        text.append(com.deepseekharness.app.util.UiText.text("实际依赖数量："))
+            .append(pkg.optInt("dependencyCount"))
+            .append('\n');
+        if (dependencies != null)
+          for (int at = 0; at < Math.min(50, dependencies.length()); at++) {
+            JSONObject dependency = dependencies.optJSONObject(at);
+            if (dependency != null)
+              text.append("  ")
+                  .append(dependency.optString("name"))
+                  .append(" · ")
+                  .append(dependency.optString("version"))
+                  .append('\n');
+          }
+        if (pkg.optInt("dependencyCount") > 50)
+          text.append(com.deepseekharness.app.util.UiText.text("摘要显示前 50 项；确认时仍核对完整依赖内容。\n"));
+        String dependencyState = pkg.optString("dependencyState");
+        if (dependencyState.equals("legacy-unknown"))
+          text.append(
+              com.deepseekharness.app.util.UiText.text("历史依赖信息不足；本次核对现存源码和实际依赖，不重新解析旧版本。\n"));
+        if (dependencyState.equals("modified-original"))
+          text.append(
+              com.deepseekharness.app.util.UiText.choose(
+                  "现存内容与旧依赖记录不同；已按本次内容重新核对。\n",
+                  "Existing content differs from the old dependency record; the current content was checked.\n"));
+        String locked = pkg.optString("dependencyLockSha256");
+        if (!locked.isEmpty())
+          text.append("pnpm · ")
+              .append(
+                  pkg.optString("packageManagerVersion").equals("not-executed")
+                      ? com.deepseekharness.app.util.UiText.choose(
+                          "随包依赖，未运行包管理器", "Bundled dependencies; package manager not run")
+                      : pkg.optString("packageManagerVersion"))
+              .append("\nSHA-256: ")
+              .append(locked)
+              .append('\n');
+        JSONObject claims = pkg.optJSONObject("authorDependencyClaims");
+        if (claims != null && claims.length() > 0)
+          text.append(
+                  com.deepseekharness.app.util.UiText.choose(
+                      "作者声明（未作为本机验证结论）：", "Author claims (not local verification): "))
+              .append(claims)
+              .append('\n');
+        JSONArray missing = pkg.optJSONArray("missingDependencies");
+        if (missing != null && missing.length() > 0)
+          text.append(com.deepseekharness.app.util.UiText.text("缺失依赖："))
+              .append(missing)
+              .append('\n');
+        if (pkg.optBoolean("existingConflict"))
+          text.append(
+              com.deepseekharness.app.util.UiText.text("当前已有同名插件，现有版本不会被覆盖。请先到插件管理处理冲突。\n"));
+        text.append('\n');
+      }
+      text.append(com.deepseekharness.app.util.UiText.text("来源："))
+          .append(
+              json.optString("source").isEmpty()
+                  ? com.deepseekharness.app.util.UiText.text("本地插件包")
+                  : json.optString("source"))
+          .append("\nSHA-256：")
+          .append(json.optString("sha256"))
+          .append(
+              json.optString("contentsSha256").isEmpty()
+                  ? ""
+                  : com.deepseekharness.app.util.UiText.format(
+                      "\n已准备内容 SHA-256：%s", json.optString("contentsSha256")))
+          .append(
+              action.equals("install")
+                  ? com.deepseekharness.app.util.UiText.choose(
+                      "\n\n安装后默认启用；Web 启动时加载，同名更新保留上一版。",
+                      "\n\nEnabled by default after installation; Web loads it on startup. Updates retain the previous version.")
+                  : com.deepseekharness.app.util.UiText.choose(
+                      "\n\n正在处理启用或回退；启动 Web 后生效。",
+                      "\n\nApplying enable or rollback; the change takes effect on Web startup."))
+          .append(
+              com.deepseekharness.app.util.UiText.choose(
+                  "\n插件将在 DSHA 的权限范围内运行。", "\nThe plugin runs with DSHA's permissions."));
+      return SensitiveData.redact(text.toString());
+    }
+  }
+
+  public static final class State {
+    public final List<Item> items;
+    public final boolean busy;
+    public final String message;
+    public final boolean cancellable;
+    public final int percent;
+
+    State(List<Item> items, boolean busy, String message) {
+      this(items, busy, message, false, -1);
+    }
+
+    State(List<Item> items, boolean busy, String message, boolean cancellable, int percent) {
+      this.items = items;
+      this.busy = busy;
+      this.message = message;
+      this.cancellable = cancellable;
+      this.percent = percent;
+    }
+  }
+
+  public PluginRepository(@NonNull Application app) {
+    this(app, IO);
+  }
+
+  PluginRepository(@NonNull Application app, java.util.concurrent.Executor io) {
+    this(app, io, com.deepseekharness.app.runtime.GuestScriptBudget.QUERY_TIMEOUT_MS);
+  }
+
+  PluginRepository(@NonNull Application app, java.util.concurrent.Executor io, long queryMillis) {
+    super(app);
+    this.io = java.util.Objects.requireNonNull(io);
+    if (queryMillis < 1) throw new IllegalArgumentException("PLUGIN_QUERY_BUDGET");
+    this.queryMillis = queryMillis;
+  }
+
+  public static PluginRepository get(Context context) {
+    return com.deepseekharness.app.DshaApp.from(context).pluginRepository();
+  }
+
+  public LiveData<State> state() {
+    return state;
+  }
+
+  public boolean isBusy() {
+    return working.get();
+  }
+
+  public boolean hasKnownItems() {
+    return itemsKnown;
+  }
+
+  public long installedRevision() {
+    return installedRevision.get();
+  }
+
+  public void invalidateInstalledState() {
+    installedRevision.incrementAndGet();
+  }
+
+  public boolean isSafeMode() {
+    return safeMode;
+  }
+
+  public boolean installationSucceeded() {
+    return installationSucceeded;
+  }
+
+  public String installedDescription() {
+    return installedPreview == null ? "" : installedPreview.description();
+  }
+
+  public void inspectCapabilities(Item item, java.util.function.Consumer<String> shown) {
+    final String[] details = {""};
+    submit(
+        com.deepseekharness.app.util.UiText.choose(
+            "正在读取插件能力声明…", "Reading plugin capability declarations…"),
+        proot -> {
+          JSONObject output =
+              result(runManager(proot, "capabilities " + ShellQuote.arg(item.name)));
+          details[0] = capabilityDescription(output.optJSONObject("capabilities"));
+          return output.getString("message");
+        },
+        () -> shown.accept(details[0]));
+  }
+
+  public static String capabilityDescription(JSONObject report) {
+    var text = new StringBuilder();
+    text.append(
+        com.deepseekharness.app.util.UiText.choose(
+            "\n静态能力信息（声明与源码线索，不代表权限或安全保证）\n",
+            "\nStatic capabilities (declarations and source references, not permissions or safety guarantees)\n"));
+    if (report == null)
+      return text.append(
+              com.deepseekharness.app.util.UiText.choose(
+                  "历史记录无此信息；可在详情中重新检查。\n",
+                  "No information in this historical record; inspect again from plugin details.\n"))
+          .toString();
+    for (String key : new String[] {"clientInject", "scripts", "pnpmfiles"}) {
+      String label =
+          switch (key) {
+            case "clientInject" ->
+                com.deepseekharness.app.util.UiText.choose(
+                    "声明的客户端服务：", "Declared client services: ");
+            case "scripts" ->
+                com.deepseekharness.app.util.UiText.choose("脚本声明：", "Script declarations: ");
+            default -> "pnpmfile: ";
+          };
+      text.append(label).append(report.optJSONArray(key)).append('\n');
+    }
+    text.append(
+            com.deepseekharness.app.util.UiText.choose(
+                "已读依赖 manifests / 脚本声明：", "Dependency manifests read / script declarations: "))
+        .append(report.optInt("inspectedDependencyManifests"))
+        .append(" / ")
+        .append(report.optInt("dependencyScriptCount"))
+        .append('\n');
+    JSONArray findings = report.optJSONArray("findings");
+    if (findings != null)
+      for (int i = 0; i < Math.min(findings.length(), 200); i++) {
+        JSONObject finding = findings.optJSONObject(i);
+        if (finding == null) continue;
+        text.append(
+                finding.optString("kind").equals("server-inject")
+                    ? com.deepseekharness.app.util.UiText.choose(
+                        "声明的服务依赖：", "Declared service dependency: ")
+                    : com.deepseekharness.app.util.UiText.choose(
+                        "设备桥调用线索：", "Device bridge source reference: "))
+            .append(finding.optString("value"))
+            .append(" · ")
+            .append(finding.optString("file"))
+            .append(':')
+            .append(finding.optInt("line"))
+            .append('\n');
+      }
+    JSONArray unknown = report.optJSONArray("unknown");
+    if (unknown != null && unknown.length() > 0) {
+      text.append(com.deepseekharness.app.util.UiText.choose("未确认范围：\n", "Unconfirmed scope:\n"));
+      for (int i = 0; i < Math.min(unknown.length(), 200); i++)
+        text.append("  ").append(capabilityUnknown(unknown.optString(i))).append('\n');
+    }
+    text.append("DSH ")
+        .append(report.optString("runtimeDsh"))
+        .append(" · ")
+        .append(report.optString("parser"))
+        .append('\n');
+    return text.toString();
+  }
+
+  private static String capabilityUnknown(String value) {
+    String code = value, prefix = "";
+    int separator = value.lastIndexOf(':');
+    if (separator >= 0 && !value.startsWith("entry not inspected:")) {
+      prefix = value.substring(0, separator) + ": ";
+      code = value.substring(separator + 1);
+    }
+    String translated =
+        switch (code) {
+          case "patch references and dynamically loaded modules are not followed" ->
+              com.deepseekharness.app.util.UiText.choose(
+                  "未跟踪补丁引用与动态加载模块",
+                  "Patch references and dynamically loaded modules were not followed");
+          case "dynamic-inject", "non-literal client inject" ->
+              com.deepseekharness.app.util.UiText.choose(
+                  "动态服务声明未确认", "Dynamic service declarations are unconfirmed");
+          case "reexported-inject" ->
+              com.deepseekharness.app.util.UiText.choose(
+                  "重导出的服务声明未确认", "Reexported service declarations are unconfirmed");
+          case "dynamic-bridge" ->
+              com.deepseekharness.app.util.UiText.choose(
+                  "动态设备桥调用未确认", "Dynamic device bridge calls are unconfirmed");
+          case "node-limit", "finding-limit" ->
+              com.deepseekharness.app.util.UiText.choose(
+                  "达到静态分析预算", "Static analysis budget reached");
+          case "unparsed-source" ->
+              com.deepseekharness.app.util.UiText.choose("源码未能解析", "Source could not be parsed");
+          case "no declared server entry" ->
+              com.deepseekharness.app.util.UiText.choose("未声明服务入口", "No server entry declared");
+          case "invalid script declaration" ->
+              com.deepseekharness.app.util.UiText.choose("脚本声明格式无效", "Invalid script declaration");
+          case "dependency scripts were not inspected",
+                  "dependency script coverage incomplete",
+                  "dependency manifest coverage incomplete" ->
+              com.deepseekharness.app.util.UiText.choose(
+                  "依赖脚本声明未完整检查", "Dependency script declarations were not fully inspected");
+          case "AST parser unavailable or budget exceeded" ->
+              com.deepseekharness.app.util.UiText.choose(
+                  "静态解析器不可用或超出预算", "Static parser unavailable or budget exceeded");
+          case "package changed during inspection", "package input not inspected" ->
+              com.deepseekharness.app.util.UiText.choose(
+                  "包声明输入未能确认", "Package declaration input could not be confirmed");
+          default ->
+              value.startsWith("entry not inspected:")
+                  ? com.deepseekharness.app.util.UiText.format(
+                      "入口未检查：%s", value.substring("entry not inspected:".length()).trim())
+                  : value;
+        };
+    return prefix + translated;
+  }
+
+  public LiveData<Preview> preview() {
+    return preview;
+  }
+
+  public List<PendingReview> pendingReviews() {
+    return pendingReviews;
+  }
+
+  public void openPendingReview(String id) {
+    if (id == null || !id.matches("[a-f0-9]{32}")) return;
+    submit(
+        com.deepseekharness.app.util.UiText.choose(
+            "正在恢复未完成的插件安装…", "Resuming the pending plugin installation…"),
+        proot -> receivePreview(result(runManager(proot, "show-preview " + ShellQuote.arg(id)))),
+        this::confirmPreview);
+  }
+
+  public void reviewRestored(String operation, String node) {
+    submit(
+        com.deepseekharness.app.util.UiText.choose("正在准备隔离插件…", "Preparing the retained plugin…"),
+        proot -> {
+          String group =
+              com.deepseekharness.app.backup.QuarantinedPluginReview.prepare(
+                  getApplication(),
+                  operation,
+                  node,
+                  new com.deepseekharness.app.backup.BackupControl(null));
+          return receivePreview(
+              result(
+                  runManager(
+                      proot,
+                      "review-restored " + ShellQuote.arg(group) + " " + ShellQuote.arg(node))));
+        },
+        this::confirmPreview);
+  }
+
+  public void reviewLegacyPreset(String retainedKey) {
+    submit(
+        com.deepseekharness.app.util.UiText.choose(
+            "正在准备旧预设候选与当前依赖…", "Preparing the legacy preset and current dependencies…"),
+        proot -> {
+          String[] candidate =
+              com.deepseekharness.app.backup.QuarantinedPluginReview.preparePreset(
+                  getApplication(),
+                  retainedKey,
+                  new com.deepseekharness.app.backup.BackupControl(null));
+          return receivePreview(
+              result(
+                  runManager(
+                      proot,
+                      "review-restored "
+                          + ShellQuote.arg(candidate[0])
+                          + " "
+                          + ShellQuote.arg(candidate[1]))));
+        },
+        this::confirmPreview);
+  }
+
+  public void selectionMessage(String message) {
+    DiagnosticLog.record(getApplication(), "FILE_SELECTION", message);
+    if (!working.get()) state.setValue(new State(items, false, message));
+  }
+
+  private interface Work {
+    String run(ProotBootstrap proot) throws Exception;
+
+    default boolean maintenance() {
+      return false;
+    }
+
+    default boolean includesItems() {
+      return false;
+    }
+
+    default boolean query() {
+      return false;
+    }
+  }
+
+  /** 脚本在同一进程中返回变更后的真实列表，避免再次启动容器与重复扫描。 */
+  private Work withItems(String command) {
+    return withItems(command, false);
+  }
+
+  private Work withItems(String command, boolean query) {
+    return new Work() {
+      @Override
+      public boolean query() {
+        return query;
+      }
+
+      @Override
+      public boolean includesItems() {
+        return true;
+      }
+
+      @Override
+      public String run(ProotBootstrap proot) throws Exception {
+        JSONObject output = result(runManager(proot, command));
+        items = readItems(proot, output);
+        itemsKnown = true;
+        return output.getString("message");
+      }
+    };
+  }
+
+  private void submit(String progress, Work work) {
+    submit(progress, work, null);
+  }
+
+  private void submit(String progress, Work work, Runnable onSuccess) {
+    submit(progress, work, onSuccess, true);
+  }
+
+  private void submit(String progress, Work work, Runnable onSuccess, boolean cancellable) {
+    submit(progress, work, onSuccess, cancellable, null);
+  }
+
+  /** 获取凭据后才消耗预览/创建任务；凭据一直持有到主线程完成最后一次文件清理。 */
+  private void submit(
+      String progress, Work work, Runnable onSuccess, boolean cancellable, Runnable onAccepted) {
+    if (!working.compareAndSet(false, true)) {
+      if (work.query()) {
+        if (!queryRunning) refreshQueued = true;
+        return;
+      }
+      State shown = state.getValue();
+      state.setValue(
+          new State(
+              items,
+              true,
+              "上一项插件操作仍在进行，请完成后重新选择。",
+              shown != null && shown.cancellable,
+              shown == null ? -1 : shown.percent));
+      return;
+    }
+    HarnessController controller = HarnessController.get(getApplication());
+    String blocked = environmentBlockMessage();
+    if (!blocked.isEmpty()) {
+      working.set(false);
+      state.setValue(new State(items, false, blocked));
+      return;
+    }
+    com.deepseekharness.app.util.EnvironmentTaskGate.Lease lease =
+        com.deepseekharness.app.util.EnvironmentTaskGate.tryAcquire("插件操作");
+    if (lease == null) {
+      working.set(false);
+      state.setValue(new State(items, false, "已有环境任务启动，请稍后刷新或重试插件操作"));
+      return;
+    }
+    if (com.deepseekharness.app.core.MaintenanceCoordinator.pending(controller)
+        || com.deepseekharness.app.core.MaintenanceCoordinator.isExclusive()) {
+      lease.close();
+      working.set(false);
+      state.setValue(new State(items, false, "环境维护尚未完成，请先恢复维护，再刷新或操作插件"));
+      return;
+    }
+    RuntimeTasks runtimeWork;
+    try {
+      runtimeWork = RuntimeTasks.beginDetached("插件管理");
+      runtimeWork.describe(progress);
+    } catch (RuntimeException | Error error) {
+      lease.close();
+      working.set(false);
+      state.setValue(
+          new State(
+              items, false, "插件任务未开始：" + SensitiveData.redact(String.valueOf(error.getMessage()))));
+      return;
+    }
+    PluginTask task;
+    try {
+      task = new PluginTask(controller.proot().getRootfsDir());
+    } catch (RuntimeException | Error error) {
+      runtimeWork.close();
+      lease.close();
+      working.set(false);
+      throw error;
+    }
+    activeTask = task;
+    queryRunning = work.query();
+    var queryBudget =
+        work.query()
+            ? new com.deepseekharness.app.runtime.GuestScriptBudget(
+                queryMillis, task::requested, "PLUGIN_QUERY")
+            : null;
+    Runnable poll =
+        new Runnable() {
+          @Override
+          public void run() {
+            if (activeTask != task || !working.get()) return;
+            JSONObject detail = task.read();
+            long total = detail.optLong("total"), current = detail.optLong("current");
+            int percent = total > 0 ? (int) Math.min(100, current * 100 / total) : -1;
+            String message =
+                task.requested() ? "正在取消，请等待当前提交完成或临时文件清理…" : detail.optString("message", progress);
+            if (!task.requested() && current > 0 && detail.optString("stage").equals("download"))
+              message +=
+                  String.format(
+                      java.util.Locale.ROOT,
+                      " %.1f MiB%s",
+                      current / 1048576.0,
+                      percent < 0 ? "" : " · " + percent + "%");
+            runtimeWork.describe(message);
+            state.setValue(
+                new State(
+                    items,
+                    true,
+                    message,
+                    cancellable
+                        && !task.requested()
+                        && (work.query() || detail.optBoolean("cancellable", true)),
+                    percent));
+            main.postDelayed(this, 400);
+          }
+        };
+    try {
+      if (onAccepted != null) onAccepted.run();
+      state.setValue(new State(items, true, progress, cancellable, -1));
+      main.post(poll);
+      DiagnosticLog.record(getApplication(), "PLUGIN_START", progress);
+      io.execute(
+          () -> runTask(controller, task, lease, runtimeWork, poll, work, onSuccess, queryBudget));
+    } catch (RuntimeException error) {
+      main.removeCallbacks(poll);
+      finishTask(
+          task,
+          lease,
+          runtimeWork,
+          new State(items, false, "插件任务未开始：" + SensitiveData.redact(String.valueOf(error))),
+          null,
+          false,
+          false);
+    }
+  }
+
+  /** 只读门禁提示；已运行的 Web 不占用 EnvironmentTaskGate，不影响正常插件操作。 */
+  public String environmentBlockMessage() {
+    HarnessController controller = HarnessController.get(getApplication());
+    if (com.deepseekharness.app.core.MaintenanceCoordinator.pending(controller))
+      return "上次环境维护未完成，请到安装与修复页恢复维护，再刷新或操作插件";
+    if (com.deepseekharness.app.core.MaintenanceCoordinator.isEnvironmentTaskBusy()) {
+      String kind = com.deepseekharness.app.util.EnvironmentTaskGate.activeKind();
+      return (kind.isEmpty() ? "正在执行环境任务" : "正在" + kind) + "，请稍后刷新或重试插件操作";
+    }
+    return "";
+  }
+
+  private void runTask(
+      HarnessController controller,
+      PluginTask task,
+      com.deepseekharness.app.util.EnvironmentTaskGate.Lease lease,
+      RuntimeTasks runtimeWork,
+      Runnable poll,
+      Work work,
+      Runnable onSuccess,
+      com.deepseekharness.app.runtime.GuestScriptBudget queryBudget) {
+    State completed;
+    boolean[] success = {false};
+    try (var budgetScope = queryBudget == null ? null : queryBudget.enter()) {
+      if (queryBudget != null) queryBudget.remainingMillis();
+      completed =
+          lease.run(
+              () -> {
+                // 防止排队前检查与真正访问 rootfs 之间出现未完成的维护事务。
+                if (com.deepseekharness.app.core.MaintenanceCoordinator.pending(controller)
+                    || com.deepseekharness.app.core.MaintenanceCoordinator.isExclusive())
+                  throw new IOException("环境维护尚未完成，请先恢复维护，再刷新或操作插件");
+                ProotBootstrap proot = controller.proot();
+                String message;
+                try {
+                  task.check();
+                  if (!proot.isEnvironmentReady()) throw new IOException("环境未就绪，请先完成解压 / 安装");
+                  if (queryBudget != null) queryBudget.remainingMillis();
+                  if (work.maintenance()) {
+                    // 确认前的排队凭据已经完成职责；维护期间由原有屏障持有同步工作锁。
+                    try (RuntimeTasks synchronous = RuntimeTasks.begin()) {
+                      runtimeWork.close();
+                      message =
+                          com.deepseekharness.app.core.MaintenanceCoordinator.exclusive(
+                              controller, () -> work.run(proot));
+                    }
+                  } else message = work.run(proot);
+                  success[0] = true;
+                } catch (Exception error) {
+                  message = failureMessage(error);
+                }
+                main.removeCallbacks(poll);
+                // 错误立即发布，不再同凭据补跑完整列表。成功后的查询独立合并调度。
+                return new State(items, false, message);
+              });
+    } catch (Exception error) {
+      completed = new State(items, false, failureMessage(error));
+    }
+    main.removeCallbacks(poll);
+    State result = completed;
+    if (!main.post(
+        () ->
+            finishTask(
+                task,
+                lease,
+                runtimeWork,
+                result,
+                success[0] ? onSuccess : null,
+                success[0],
+                success[0] && !work.includesItems()))) {
+      // 主 Looper 已关闭时不再发布 UI，但清理文件仍先于释放环境凭据。
+      task.close();
+      runtimeWork.close();
+      activeTask = null;
+      queryRunning = false;
+      working.set(false);
+      lease.close();
+    }
+  }
+
+  private void finishTask(
+      PluginTask task,
+      com.deepseekharness.app.util.EnvironmentTaskGate.Lease lease,
+      RuntimeTasks runtimeWork,
+      State completed,
+      Runnable onSuccess,
+      boolean successful,
+      boolean refreshAfter) {
+    // 任一步清理抛错都不交还环境所有权；不能让维护越过尚未完成的结束阶段。
+    try {
+      task.close();
+    } catch (RuntimeException error) {
+      state.setValue(
+          new State(
+              items,
+              true,
+              "插件清理失败，保留环境占用：" + SensitiveData.redact(String.valueOf(error)),
+              false,
+              -1));
+      return;
+    }
+    runtimeWork.close();
+    activeTask = null;
+    queryRunning = false;
+    working.set(false);
+    lease.close();
+    DiagnosticLog.record(getApplication(), "PLUGIN_RESULT", completed.message);
+    state.setValue(completed);
+    if (!successful) refreshQueued = false;
+    else if (refreshAfter) refreshQueued = true;
+    // startWeb 等后续动作要在凭据释放之后执行。
+    if (onSuccess != null) onSuccess.run();
+    if (refreshQueued && !working.get()) main.post(queuedRefresh);
+  }
+
+  public void cancelTask() {
+    PluginTask task = activeTask;
+    State shown = state.getValue();
+    if (task == null || shown == null || !shown.cancellable) return;
+    try {
+      task.cancel();
+    } catch (IOException error) {
+      state.setValue(new State(items, true, error.getMessage()));
+    }
+  }
+
+  private String runManager(ProotBootstrap proot, String args) throws IOException {
+    PluginTask task = activeTask;
+    if (task != null) task.check();
+    try {
+      return com.deepseekharness.app.util.GuestCommandOutcome.requireCompleted(
+          proot.runPluginManagerResult(
+              args,
+              task == null ? "" : task.id,
+              new ConfigStore(getApplication()).getPluginDownloadSource()),
+          "PLUGIN_MANAGER");
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new java.io.InterruptedIOException("PLUGIN_MANAGER_INTERRUPTED");
+    }
+  }
+
+  public void refresh() {
+    submit("正在检测 Web、终端和本地安装的插件…", withItems("refresh", true), null, true);
+  }
+
+  public void install(PluginSource source) {
+    inspect(source, "", "", "");
+  }
+
+  public void inspect(PluginSource source, String sha256, String name, String version) {
+    if (working.get()) return;
+    Preview old = preview.getValue();
+    submit(
+        "正在下载并解析：" + source.description(),
+        proot -> {
+          if (old != null) {
+            discardPreviewConfirmed(proot, old.id);
+            preparedPreview = null;
+            preview.postValue(null);
+          }
+          JSONObject request =
+              new JSONObject()
+                  .put("command", source.command())
+                  .put("sha256", sha256)
+                  .put("name", name)
+                  .put("version", version);
+          return receivePreview(
+              result(runManager(proot, "inspect " + ShellQuote.arg(request.toString()))));
+        },
+        this::confirmPreview,
+        true,
+        () -> installationSucceeded = false);
+  }
+
+  private String receivePreview(JSONObject output) throws Exception {
+    if (!"ok".equals(output.optString("status")))
+      throw new IOException(output.optString("message"));
+    if (activeTask != null && activeTask.requested()) {
+      Preview candidate = new Preview(output.getJSONObject("preview"));
+      try {
+        discardPreviewConfirmed(HarnessController.get(getApplication()).proot(), candidate.id);
+      } catch (Exception failure) {
+        preview.postValue(candidate);
+        throw new IOException(
+            "已请求取消，但临时包清理未确认；预览原件仍可重试清理："
+                + SensitiveData.redact(String.valueOf(failure.getMessage())),
+            failure);
+      }
+      throw new IOException("已取消解析并清理临时包");
+    }
+    Preview candidate = new Preview(output.getJSONObject("preview"));
+    preparedPreview = candidate;
+    preview.postValue(candidate);
+    return com.deepseekharness.app.util.UiText.choose(
+        "插件包已解析，正在安装并启用", "Plugin package resolved; installing and enabling");
+  }
+
+  public void confirmPreview() {
+    Preview selected = preparedPreview != null ? preparedPreview : preview.getValue();
+    if (selected == null || working.get()) return;
+    HarnessController controller = HarnessController.get(getApplication());
+    boolean resumeWeb =
+        !controller.getWebAuthUrl().isEmpty() && !controller.startupDiagnostics().snapshot().safe;
+    submit(
+        com.deepseekharness.app.util.UiText.choose("正在提交插件并启用…", "Installing and enabling plugin…"),
+        new Work() {
+          @Override
+          public boolean maintenance() {
+            return true;
+          }
+
+          @Override
+          public String run(ProotBootstrap proot) throws Exception {
+            JSONObject output =
+                result(
+                    runManager(
+                        proot,
+                        "install-preview "
+                            + ShellQuote.arg(selected.id)
+                            + " "
+                            + ShellQuote.arg(selected.confirmation)));
+            if (!"ok".equals(output.optString("status")))
+              throw new IOException(operationMessage(output));
+            installationSucceeded = true;
+            return operationMessage(output);
+          }
+        },
+        () -> {
+          preparedPreview = null;
+          preview.setValue(null);
+          if (resumeWeb && !controller.startWeb(message -> {}))
+            state.setValue(
+                new State(
+                    items,
+                    false,
+                    com.deepseekharness.app.util.UiText.choose(
+                        "插件已安装并启用；Web 未自动重启，请在启动页重试",
+                        "Plugin installed and enabled; restart Web from the launch page")));
+        },
+        true,
+        () -> {
+          installationSucceeded = false;
+          installedPreview = selected;
+        });
+  }
+
+  public void discardPreview() {
+    Preview old = preview.getValue();
+    if (old == null) return;
+    submit(
+        "正在清理插件安装预览…",
+        proot -> {
+          discardPreviewConfirmed(proot, old.id);
+          return "插件安装预览已取消";
+        },
+        () -> {
+          preparedPreview = null;
+          preview.setValue(null);
+        },
+        false);
+  }
+
+  private static void discardPreviewConfirmed(ProotBootstrap proot, String id) throws Exception {
+    requireDiscardResult(proot.runPluginManagerResult("discard-preview " + ShellQuote.arg(id), ""));
+  }
+
+  static void requireDiscardResult(
+      com.deepseekharness.app.util.BoundedProcessRunner.Result execution) throws Exception {
+    String text =
+        com.deepseekharness.app.util.GuestCommandOutcome.requireCompleted(
+            execution, "PLUGIN_DISCARD_PREVIEW");
+    com.deepseekharness.app.util.PluginOutput.requireDiscardSuccess(text);
+  }
+
+  public void checkUpdates(Item item) {
+    submit(
+        "正在检查插件版本…",
+        proot ->
+            operationMessage(
+                result(
+                    runManager(
+                        proot,
+                        "check-updates" + (item == null ? "" : " " + ShellQuote.arg(item.name))))));
+  }
+
+  public void prepareUpdate(Item item) {
+    if (working.get() || !item.updateAvailable) return;
+    Preview old = preview.getValue();
+    submit(
+        "正在下载并核对更新包…",
+        proot -> {
+          if (old != null) {
+            discardPreviewConfirmed(proot, old.id);
+            preparedPreview = null;
+            preview.postValue(null);
+          }
+          return receivePreview(
+              result(runManager(proot, "prepare-update " + ShellQuote.arg(item.name))));
+        },
+        this::confirmPreview,
+        true);
+  }
+
+  public void rollback(Item item) {
+    submit(
+        "正在回退 " + item.name + "…",
+        proot ->
+            receivePreview(
+                result(
+                    runManager(
+                        proot,
+                        "rollback "
+                            + ShellQuote.arg(item.name)
+                            + " "
+                            + ShellQuote.arg(item.rollbackVersion)))),
+        this::confirmPreview);
+  }
+
+  public void safeMode(boolean enable, Runnable afterSuccess) {
+    submit(
+        enable ? "正在暂时停用第三方插件…" : "正在恢复此前启用的第三方插件…",
+        proot -> {
+          JSONObject output = result(runManager(proot, "safe-mode " + (enable ? "on" : "off")));
+          if (!"ok".equals(output.optString("status")))
+            throw new IOException(output.optString("message"));
+          return output.getString("message");
+        },
+        afterSuccess);
+  }
+
+  public void importArchive(Uri uri) {
+    if (working.get()) return;
+    Preview old = preview.getValue();
+    submit(
+        com.deepseekharness.app.util.UiText.choose("正在解析本地插件包…", "Resolving local plugin package…"),
+        proot -> {
+          if (old != null) {
+            discardPreviewConfirmed(proot, old.id);
+            preparedPreview = null;
+            preview.postValue(null);
+          }
+          File temporary =
+              File.createTempFile("plugin-import-", ".bin", getApplication().getCacheDir());
+          String container = "/root/.dsh/plugin-upload-" + UUID.randomUUID() + ".bin";
+          try {
+            try (InputStream in = getApplication().getContentResolver().openInputStream(uri);
+                OutputStream out = new FileOutputStream(temporary)) {
+              copy(in, out);
+            }
+            if (!proot.pushFileIntoContainer(temporary, container))
+              throw new IOException("插件包写入容器失败");
+            JSONObject request =
+                new JSONObject().put("command", "file " + ShellQuote.arg(container));
+            return receivePreview(
+                result(runManager(proot, "inspect " + ShellQuote.arg(request.toString()))));
+          } finally {
+            temporary.delete();
+            cleanup(proot, container);
+          }
+        },
+        this::confirmPreview,
+        true,
+        () -> installationSucceeded = false);
+  }
+
+  public void exportArchives(List<String> names, Uri uri) {
+    submit(
+        "正在打包并保存插件…",
+        proot -> {
+          File temporary =
+              File.createTempFile("plugin-export-", ".tar.gz", getApplication().getCacheDir());
+          String container = "/root/.dsh/plugin-export-" + UUID.randomUUID() + ".tar.gz";
+          boolean saved = false;
+          try {
+            JSONObject output =
+                result(
+                    runManager(
+                        proot,
+                        "export "
+                            + ShellQuote.arg(new JSONArray(names).toString())
+                            + " "
+                            + ShellQuote.arg(container)));
+            if (!"ok".equals(output.optString("status")))
+              throw new IOException(output.optString("message"));
+            if (!proot.pullFileFromContainer(container, temporary))
+              throw new IOException("插件包取回失败");
+            try (InputStream in = new FileInputStream(temporary);
+                OutputStream out =
+                    getApplication().getContentResolver().openOutputStream(uri, "wt")) {
+              copy(in, out);
+            }
+            saved = true;
+            return "已将 " + names.size() + " 个插件导出到所选位置，可在另一台 DSHA 中导入";
+          } finally {
+            temporary.delete();
+            cleanup(proot, container);
+            if (!saved) {
+              try {
+                DocumentsContract.deleteDocument(getApplication().getContentResolver(), uri);
+              } catch (Exception ignored) {
+              }
+            }
+          }
+        });
+  }
+
+  public void setEnabled(Item item, boolean enable) {
+    submit(
+        "正在" + (enable ? "启用 " : "禁用 ") + item.name,
+        new Work() {
+          @Override
+          public boolean includesItems() {
+            return true;
+          }
+
+          @Override
+          public String run(ProotBootstrap proot) throws Exception {
+            JSONObject output =
+                result(
+                    runManager(
+                        proot,
+                        (enable ? "enable-state " : "disable-state ") + ShellQuote.arg(item.name)));
+            requireIntentReceipt(output, item.name, enable);
+            List<Item> next = new ArrayList<>();
+            for (Item existing : items)
+              next.add(existing.name.equals(item.name) ? existing.withIntent(enable) : existing);
+            items = Collections.unmodifiableList(next);
+            invalidateInstalledState();
+            return output.getString("message");
+          }
+        },
+        () -> {
+          refreshQueued = true;
+          main.post(queuedRefresh);
+        },
+        false);
+  }
+
+  static void requireIntentReceipt(JSONObject output, String name, boolean enable)
+      throws Exception {
+    if (!"ok".equals(output.optString("status"))
+        || !name.equals(output.optString("name"))
+        || !(output.opt("enabled") instanceof Boolean)
+        || output.getBoolean("enabled") != enable
+        || !Boolean.TRUE.equals(output.opt("intentVerified")))
+      throw new IOException("插件启停结果未确认；未自动重试，请刷新核对实际状态");
+  }
+
+  public void delete(Item item) {
+    if (!item.deletable) return;
+    submit("正在删除 " + item.name + "…", withItems("delete-list " + ShellQuote.arg(item.name)));
+  }
+
+  private List<Item> readItems(ProotBootstrap proot, JSONObject output) throws Exception {
+    if (!"ok".equals(output.optString("status")))
+      throw new IOException(output.optString("message"));
+    JSONArray array = output.getJSONArray("items");
+    safeMode = output.optBoolean("safeMode");
+    List<PendingReview> pending = new ArrayList<>();
+    JSONArray stored = output.optJSONArray("pendingReviews");
+    if (stored != null)
+      for (int i = 0; i < Math.min(128, stored.length()); i++)
+        pending.add(new PendingReview(stored.getJSONObject(i)));
+    pendingReviews = Collections.unmodifiableList(pending);
+    List<Item> next = new ArrayList<>();
+    for (int i = 0; i < array.length(); i++) {
+      Item item = new Item(array.getJSONObject(i));
+      if (!com.deepseekharness.app.util.BuiltinPlugins.internal(item.name)) next.add(item);
+    }
+    // 临时插件由当前 Web 进程提供摘要；旧进程或过期文件不能当成仍在运行。
+    HarnessController controller = HarnessController.get(getApplication());
+    File activity = new File(proot.getRootfsDir(), "root/.dsha-web-activity.json");
+    if (!controller.getWebAuthUrl().isEmpty()
+        && activity.isFile()
+        && activity.length() <= 256 * 1024) {
+      try {
+        JSONObject snapshot = new JSONObject(com.deepseekharness.app.util.Compat.readAll(activity));
+        long age = System.currentTimeMillis() - snapshot.optLong("at");
+        if (age >= 0
+            && age <= 10_000
+            && Long.toString(controller.getWebGeneration())
+                .equals(snapshot.optString("generation"))) {
+          JSONArray dynamic = snapshot.optJSONArray("plugins");
+          if (dynamic != null)
+            for (int i = 0; i < Math.min(256, dynamic.length()); i++) {
+              JSONObject row = dynamic.getJSONObject(i);
+              String session = row.optString("sessionId");
+              JSONObject item =
+                  new JSONObject()
+                      .put("name", row.optString("name"))
+                      .put("dynamic", true)
+                      .put("available", true)
+                      .put("enabled", row.optBoolean("active"))
+                      .put("location", "会话 " + session.substring(Math.max(0, session.length() - 8)))
+                      .put("description", "会话内临时插件，请在 Web 页面管理；重启后需重新定义，不作为安装包备份。");
+              next.add(new Item(item));
+            }
+        }
+      } catch (Exception ignored) {
+        /* 临时摘要失效不影响持久插件列表。 */
+      }
+    }
+    return Collections.unmodifiableList(next);
+  }
+
+  private static JSONObject result(String output) throws Exception {
+    String text = output == null ? "" : output.trim();
+    String result = com.deepseekharness.app.util.PluginOutput.resultJson(text);
+    if (result.isEmpty()) throw new IOException(shortError(text));
+    JSONObject json = new JSONObject(result);
+    if (!json.has("status") || !json.has("message")) throw new IOException("插件操作返回了不完整的结果");
+    // error/partial 也保留脚本给出的完整原因；不能靠输出中出现一次 OK 判断整个操作成功。
+    json.put("message", SensitiveData.redact(json.getString("message")));
+    return json;
+  }
+
+  private static String operationMessage(JSONObject result) throws Exception {
+    String status = result.getString("status");
+    String message =
+        ("partial".equals(status) ? "部分完成：\n" : "error".equals(status) ? "安装失败：\n" : "")
+            + result.getString("message");
+    if (!"ok".equals(status)) throw new IOException(message);
+    return message;
+  }
+
+  private static String shortError(String text) {
+    if (text == null || text.isEmpty()) return "没有收到插件管理结果";
+    if (text.equals("ENV_NOT_READY")) return "环境未就绪，请先完成解压 / 安装";
+    String safe = SensitiveData.redact(text.trim());
+    return safe.length() <= 800 ? safe : safe.substring(safe.length() - 800);
+  }
+
+  private static String failureMessage(Exception error) {
+    String detail = String.valueOf(error.getMessage());
+    Throwable cause = error.getCause();
+    for (int depth = 0; cause != null && depth < 8; depth++, cause = cause.getCause()) {
+      String nested = String.valueOf(cause.getMessage());
+      if (nested.equals("PLUGIN_QUERY_CANCELLED")
+          || nested.equals("PLUGIN_QUERY_TIMEOUT")
+          || nested.equals("PLUGIN_INTENT_TIMEOUT")
+          || nested.equals("PLUGIN_INTENT_CANCELLED")) {
+        detail = nested;
+        break;
+      }
+    }
+    if ("PLUGIN_QUERY_CANCELLED".equals(detail)) return "已取消插件列表读取";
+    if ("PLUGIN_QUERY_TIMEOUT".equals(detail)) return "插件列表读取已超时，保留上次结果；请刷新重试";
+    if ("PLUGIN_INTENT_TIMEOUT".equals(detail) || "PLUGIN_INTENT_CANCELLED".equals(detail))
+      return "插件启停结果未确认；未自动重试，请刷新核对实际状态";
+    return "操作失败：" + SensitiveData.redact(detail);
+  }
+
+  private void copy(InputStream in, OutputStream out) throws IOException {
+    if (in == null || out == null) throw new IOException("无法打开所选文件，请重新选择位置");
+    long size = 0;
+    byte[] bytes = new byte[65536];
+    int count;
+    while ((count = in.read(bytes)) != -1) {
+      if (activeTask != null) activeTask.check();
+      size += count;
+      if (size > MAX_ARCHIVE) throw new IOException("插件包不能超过 256 MiB");
+      out.write(bytes, 0, count);
+    }
+    if (size == 0) throw new IOException("插件包为空");
+  }
+
+  private static void cleanup(ProotBootstrap proot, String path) {
+    // 只清理由本类生成的单个暂存文件，不递归清理插件目录。
+    new File(proot.getRootfsDir(), path.substring(1)).delete();
+  }
+}
