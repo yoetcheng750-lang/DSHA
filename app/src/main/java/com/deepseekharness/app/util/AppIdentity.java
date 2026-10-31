@@ -9,7 +9,7 @@ public final class AppIdentity {
   }
 
   public static String displayName() {
-    return "DSHA 魔改版";
+    return "DSHA Unlocked";
   }
 
   public static String publicDirectoryName() {
